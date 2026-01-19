@@ -1,260 +1,284 @@
 package com.easytap.contoller;
 
-import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-import jakarta.annotation.PostConstruct;
-
+import org.json.JSONArray;
 import org.json.JSONObject;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.scheduling.annotation.Scheduled;
-import org.springframework.web.bind.annotation.*;
+import org.springframework.web.bind.annotation.CrossOrigin;
+import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
+import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.reactive.function.client.WebClient;
+
+import jakarta.annotation.PostConstruct;
 
 @RestController
 @RequestMapping("/api/pos")
 @CrossOrigin(origins = "*")
 public class PaymentController {
 
-    // ---------------- STORES (THREAD SAFE) ----------------
-    private final Map<String, String> transactionStore = new ConcurrentHashMap<>();
-    private final Map<String, LocalDateTime> transactionStartTime = new ConcurrentHashMap<>();
-    private final Map<String, Integer> retryCount = new ConcurrentHashMap<>();
-    private final Map<String, LocalDateTime> nextRetryTime = new ConcurrentHashMap<>();
+	// ---------------- STORES (THREAD SAFE) ----------------
+	private final Map<String, String> transactionStore = new ConcurrentHashMap<>();
+	private final Map<String, LocalDateTime> transactionStartTime = new ConcurrentHashMap<>();
+	private final Map<String, Integer> retryCount = new ConcurrentHashMap<>();
+	private final Map<String, LocalDateTime> nextRetryTime = new ConcurrentHashMap<>();
 
-    private final Set<String> processedTransactions = ConcurrentHashMap.newKeySet();
+	private final Set<String> processedTransactions = ConcurrentHashMap.newKeySet();
 
-    @Value("${ezetap.mode}") // 0 = PROD, 1 = DEMO
-    private int ezetapMode;
+	// 🔹 ADDED: TERMINAL STATUSES
+	private static final Set<String> TERMINAL_STATUSES = Set.of("SUCCESS", "FAILED", "CANCELLED", "CANCELED",
+			"DECLINED", "TIMEOUT", "ABORTED");
 
-    private WebClient webClient;
+	@Value("${ezetap.mode}") // 0 = PROD, 1 = DEMO
+	private int ezetapMode;
 
-    // ---------------- INIT ----------------
-    @PostConstruct
-    public void initWebClient() {
+	private WebClient webClient;
 
-        String baseUrl =
-                (ezetapMode == 1)
-                        ? "https://www.ezetap.com/api/3.0"
-                        : "https://demo.ezetap.com/api/3.0";
+	// ---------------- INIT ----------------
+	@PostConstruct
+	public void initWebClient() {
 
-       
-        System.out.println("EZETAP INITIALIZED");
-        System.out.println("MODE             " + (ezetapMode == 1 ? "PROD" : "DEMO"));
-        System.out.println("BASE URL         " + baseUrl);
-       
+		String baseUrl = (ezetapMode == 1) ? "https://www.ezetap.com/api/3.0" : "https://demo.ezetap.com/api/3.0";
 
-        this.webClient = WebClient.create(baseUrl);
-    }
+		System.out.println("EZETAP INITIALIZED");
+		System.out.println("MODE             " + (ezetapMode == 1 ? "PROD" : "DEMO"));
+		System.out.println("BASE URL         " + baseUrl);
 
-    // ---------------- START PAYMENT ----------------
-    @PostMapping("/start")
-    public ResponseEntity<?> startPayment(@RequestBody Map<String, Object> requestData) {
+		this.webClient = WebClient.create(baseUrl);
+	}
 
-        System.out.println("\n--------- START PAYMENT ----------");
-        System.out.println("REQUEST DATA → " + requestData);
+	// 🔹 ADDED: STATUS NORMALIZER
+	private String normalizeStatus(String status) {
+		if (status == null)
+			return "PENDING";
+		return status.trim().toUpperCase();
+	}
 
-        String externalRefNumber = UUID.randomUUID().toString();
+	// ---------------- START PAYMENT ----------------
+	@PostMapping("/start")
+	public ResponseEntity<?> startPayment(@RequestBody Map<String, Object> requestData) {
 
-        Map<String, Object> ezetapPayload = Map.of(
-                "appKey", "6a7f0df7-0cfe-4373-b079-c028766febba",
-                "pushTo", Map.of("deviceId", requestData.get("deviceId")),
-                "username", "1034573865",
-                "amount", requestData.get("amount"),
-                "externalRefNumber", externalRefNumber,
-                "customerMobileNumber", requestData.get("customerMobileNumber"),
-                "customerName", requestData.get("customerName"),
-                "callbackUrl", "https://yet-indie-bye-damages.trycloudflare.com/api/pos/webhook"
-        );
+		System.out.println("\n--------- START PAYMENT ----------");
+		System.out.println("REQUEST DATA → " + requestData);
 
-        System.out.println("P2P START PAYLOAD → " + ezetapPayload);
+		JSONArray externalRefNumber = new JSONArray();
+		JSONObject obj = new JSONObject();
+		obj.put("918010061420644", "2.00");
+		obj.put("IFSC" + 1, "UTIB0000289");
 
-        String response;
-        try {
-            response = webClient.post()
-                    .uri("/p2p/start")
-                    .bodyValue(ezetapPayload)
-                    .retrieve()
-                    .bodyToMono(String.class)
-                    .block();
+		externalRefNumber.put(obj);
 
-            System.out.println("P2P START RESPONSE → " + response);
+		System.out.println(externalRefNumber);
 
-        } catch (Exception ex) {
-            System.err.println(" EZETAP START API FAILED");
-            ex.printStackTrace();
-            return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
-                    .body("Ezetap API unreachable");
-        }
+		Map<String, Object> ezetapPayload = Map.of("appKey", "6a7f0df7-0cfe-4373-b079-c028766febba", "pushTo",
+				Map.of("deviceId", requestData.get("deviceId")), "username", "1034573865", "amount",
+				requestData.get("amount"), "externalRefNumber", externalRefNumber.toString(), "customerMobileNumber",
+				requestData.get("customerMobileNumber"), "customerName", requestData.get("customerName"), "callbackUrl",
+				"https://yet-indie-bye-damages.trycloudflare.com/api/pos/webhook");
 
-        JSONObject json = new JSONObject(response);
-        if (!json.optBoolean("success")) {
-            System.err.println(" START FAILED → " + json);
-            return ResponseEntity.badRequest().body(json.toMap());
-        }
+		System.out.println("P2P START PAYLOAD → " + ezetapPayload);
 
-        String p2pRequestId = json.optString("p2pRequestId", "");
-        System.out.println("P2P REQUEST ID → " + p2pRequestId);
+		String response;
+		try {
+			response = webClient.post().uri("/p2p/start").bodyValue(ezetapPayload).retrieve().bodyToMono(String.class)
+					.block();
 
-        transactionStore.put(p2pRequestId, "PENDING");
-        transactionStartTime.put(p2pRequestId, LocalDateTime.now());
-        retryCount.put(p2pRequestId, 0);
-        nextRetryTime.put(p2pRequestId, LocalDateTime.now());
+			System.out.println("P2P START RESPONSE → " + response);
 
-        return ResponseEntity.ok(Map.of(
-                "success", true,
-                "externalRefNumber", externalRefNumber,
-                "p2pRequestId", p2pRequestId
-        ));
-    }
+		} catch (Exception ex) {
+			System.err.println(" EZETAP START API FAILED");
+			ex.printStackTrace();
+			return ResponseEntity.status(HttpStatus.BAD_GATEWAY).body("Ezetap API unreachable");
+		}
 
-    // ---------------- SCHEDULER ----------------
-    @Scheduled(fixedDelay = 15000, initialDelay = 10000)
-    public void checkPendingTransactions() {
+		JSONObject json = new JSONObject(response);
+		if (!json.optBoolean("success")) {
+			System.err.println(" START FAILED → " + json);
+			return ResponseEntity.badRequest().body(json.toMap());
+		}
 
-        System.out.println(" SCHEDULER RUNNING AT " + LocalDateTime.now());
+		String p2pRequestId = json.optString("p2pRequestId", "");
+		System.out.println("P2P REQUEST ID → " + p2pRequestId);
 
-        if (ezetapMode == 0) {
-            System.out.println("DEMO MODE → POLLING SKIPPED");
-            return;
-        }
+		transactionStore.put(p2pRequestId, "PENDING");
+		transactionStartTime.put(p2pRequestId, LocalDateTime.now());
+		retryCount.put(p2pRequestId, 0);
+		nextRetryTime.put(p2pRequestId, LocalDateTime.now());
 
-        for (String txnId : transactionStore.keySet()) {
+		return ResponseEntity
+				.ok(Map.of("success", true, "externalRefNumber", externalRefNumber, "p2pRequestId", p2pRequestId));
+	}
 
-            System.out.println("CHECKING TXN → " + txnId);
+	// ---------------- SCHEDULER ----------------
+	@Scheduled(fixedDelay = 15000, initialDelay = 10000)
+	public void checkPendingTransactions() {
 
-            if (processedTransactions.contains(txnId)) {
-                System.out.println("ALREADY PROCESSED → CLEANUP");
-                cleanup(txnId);
-                continue;
-            }
+		System.out.println(" SCHEDULER RUNNING AT " + LocalDateTime.now());
 
-            String status = transactionStore.get(txnId);
-            System.out.println("CURRENT STATUS → " + status);
+		if (ezetapMode == 0) {
+			System.out.println("DEMO MODE → POLLING SKIPPED");
+			return;
+		}
 
-            if (!"PENDING".equalsIgnoreCase(status)) {
-                processedTransactions.add(txnId);
-                cleanup(txnId);
-                continue;
-            }
+		for (String txnId : transactionStore.keySet()) {
 
-            try {
-                String newStatus = fetchStatusFromEzetap(txnId);
-                System.out.println("NEW STATUS FROM EZETAP → " + newStatus);
+			System.out.println("CHECKING TXN → " + txnId);
 
-                transactionStore.put(txnId, newStatus);
+			if (processedTransactions.contains(txnId)) {
+				System.out.println("ALREADY PROCESSED → CLEANUP");
+				cleanup(txnId);
+				continue;
+			}
 
-            } catch (Exception e) {
-                System.err.println(" POLLING ERROR FOR " + txnId);
-                e.printStackTrace();
-            }
-        }
-    }
+			String status = normalizeStatus(transactionStore.get(txnId));
+			System.out.println("CURRENT STATUS → " + status);
 
-    // ---------------- STATUS FETCH ----------------
-    private String fetchStatusFromEzetap(String txnId) {
+			// 🔹 ADDED: TERMINAL STATUS HANDLING
+			if (TERMINAL_STATUSES.contains(status)) {
+				System.out.println("TERMINAL STATUS FOUND → " + status);
+				processedTransactions.add(txnId);
+				cleanup(txnId);
+				continue;
+			}
 
-        System.out.println("\n CALLING P2P STATUS API");
-        System.out.println("TXN ID → " + txnId);
+			try {
+				String newStatus = normalizeStatus(fetchStatusFromEzetap(txnId));
+				System.out.println("NEW STATUS FROM EZETAP → " + newStatus);
 
-        if (ezetapMode == 0) {
-            System.out.println("DEMO MODE → RETURNING PENDING");
-            return "PENDING";
-        }
+				transactionStore.put(txnId, newStatus);
 
-        JSONObject payload = new JSONObject();
-        payload.put("username", "1034573865");
-        payload.put("appKey", "6a7f0df7-0cfe-4373-b079-c028766febba");
-        payload.put("origP2pRequestId", txnId);
+				// 🔹 ADDED: CLEANUP AFTER POLLING
+				if (TERMINAL_STATUSES.contains(newStatus)) {
+					System.out.println("TERMINAL STATUS VIA POLLING → " + newStatus);
+					processedTransactions.add(txnId);
+					cleanup(txnId);
+				}
 
-        System.out.println("STATUS PAYLOAD → " + payload);
+			} catch (Exception e) {
+				System.err.println(" POLLING ERROR FOR " + txnId);
+				e.printStackTrace();
+			}
+		}
+	}
 
-        String response = webClient.post()
-                .uri("/p2p/status")
-                .header("Content-Type", "application/json")
-                .bodyValue(payload.toString())
-                .exchangeToMono(res ->
-                        res.bodyToMono(String.class)
-                           .map(body -> "HTTP=" + res.statusCode() + " BODY=" + body)
-                )
-                .block();
+	// ---------------- STATUS FETCH ----------------
+	private String fetchStatusFromEzetap(String txnId) {
 
-        System.out.println("RAW STATUS RESPONSE → " + response);
+		System.out.println("\n CALLING P2P STATUS API");
+		System.out.println("TXN ID → " + txnId);
 
-        return parseStatus(response);
-    }
+		if (ezetapMode == 0) {
+			System.out.println("DEMO MODE → RETURNING PENDING");
+			return "PENDING";
+		}
 
-    // ---------------- PARSER ----------------
-    private String parseStatus(String response) {
+		JSONObject payload = new JSONObject();
+		payload.put("username", "1034573865");
+		payload.put("appKey", "6a7f0df7-0cfe-4373-b079-c028766febba");
+		payload.put("origP2pRequestId", txnId);
 
-        System.out.println("PARSING RESPONSE → " + response);
+		System.out.println("STATUS PAYLOAD → " + payload);
 
-        if (response == null || !response.contains("{")) {
-            System.out.println("INVALID RESPONSE → RETURNING PENDING");
-            return "PENDING";
-        }
+		String response = webClient.post().uri("/p2p/status").header("Content-Type", "application/json")
+				.bodyValue(payload.toString())
+				.exchangeToMono(
+						res -> res.bodyToMono(String.class).map(body -> "HTTP=" + res.statusCode() + " BODY=" + body))
+				.block();
 
-        JSONObject json = new JSONObject(response.substring(response.indexOf("{")));
+		System.out.println("RAW STATUS RESPONSE → " + response);
 
-        if (!json.optBoolean("success")) {
-            System.out.println("EZETAP SAYS NOT SUCCESS → PENDING");
-            return "PENDING";
-        }
+		return parseStatus(response);
+	}
 
-        String status = json.optString("status", "PENDING");
-        System.out.println("FINAL STATUS → " + status);
+	// ---------------- PARSER ----------------
+	private String parseStatus(String response) {
 
-        return status;
-    }
+		System.out.println("PARSING RESPONSE → " + response);
 
-    // ---------------- CLEANUP ----------------
-    private void cleanup(String txnId) {
-        System.out.println("🧹 CLEANUP → " + txnId);
-        transactionStore.remove(txnId);
-        transactionStartTime.remove(txnId);
-        retryCount.remove(txnId);
-        nextRetryTime.remove(txnId);
-    }
+		if (response == null || !response.contains("{")) {
+			System.out.println("INVALID RESPONSE → RETURNING PENDING");
+			return "PENDING";
+		}
 
-    // ---------------- WEBHOOK ----------------
-    @PostMapping("/webhook")
-    public ResponseEntity<String> ezetapWebhook(@RequestBody String payload) {
+		JSONObject json = new JSONObject(response.substring(response.indexOf("{")));
 
-        System.out.println("\n WEBHOOK RECEIVED ");
-        System.out.println("WEBHOOK PAYLOAD → " + payload);
+		if (!json.optBoolean("success")) {
+			System.out.println("EZETAP SAYS NOT SUCCESS → PENDING");
+			return "PENDING";
+		}
 
-        try {
-            JSONObject json = new JSONObject(payload);
-            JSONObject txn = json.optJSONObject("txn");
+		// 🔹 ADDED: READ CORRECT EZETAP FIELD
+		String abstractStatus = json.optString("abstractPaymentStatus", "");
+		String messageCode = json.optString("messageCode", "");
 
-            if (txn == null) {
-                System.out.println("NO TXN OBJECT → IGNORED");
-                return ResponseEntity.ok("Ignored");
-            }
+		System.out.println("ABSTRACT PAYMENT STATUS → " + abstractStatus);
+		System.out.println("MESSAGE CODE → " + messageCode);
 
-            String txnId = txn.optString("p2pRequestId");
-            String status = txn.optString("status");
+		if (!abstractStatus.isEmpty()) {
+			System.out.println("FINAL STATUS FROM abstractPaymentStatus → " + abstractStatus);
+			return abstractStatus;
+		}
 
-            System.out.println("WEBHOOK TXN ID → " + txnId);
-            System.out.println("WEBHOOK STATUS → " + status);
+		// 🔹 FALLBACK (JUST IN CASE)
+		String status = json.optString("status", "PENDING");
+		System.out.println("FALLBACK STATUS → " + status);
 
-            processedTransactions.add(txnId);
-            transactionStore.put(txnId, status);
-            cleanup(txnId);
+		return status;
+	}
 
-        } catch (Exception e) {
-            System.err.println(" WEBHOOK ERROR");
-            e.printStackTrace();
-        }
+	// ---------------- CLEANUP ----------------
+	private void cleanup(String txnId) {
+		System.out.println(" CLEANUP → " + txnId);
+		transactionStore.remove(txnId);
+		transactionStartTime.remove(txnId);
+		retryCount.remove(txnId);
+		nextRetryTime.remove(txnId);
+	}
 
-        return ResponseEntity.ok("Webhook received");
-    }
+	// ---------------- WEBHOOK ----------------
+	@PostMapping("/webhook")
+	public ResponseEntity<String> ezetapWebhook(@RequestBody String payload) {
+
+		System.out.println("\n WEBHOOK RECEIVED ");
+		System.out.println("WEBHOOK PAYLOAD → " + payload);
+
+		try {
+			JSONObject json = new JSONObject(payload);
+			JSONObject txn = json.optJSONObject("txn");
+
+			if (txn == null) {
+				System.out.println("NO TXN OBJECT → IGNORED");
+				return ResponseEntity.ok("Ignored");
+			}
+
+			String txnId = txn.optString("p2pRequestId");
+			String status = normalizeStatus(txn.optString("status"));
+
+			System.out.println("WEBHOOK TXN ID → " + txnId);
+			System.out.println("WEBHOOK STATUS → " + status);
+
+			// ADDED: TERMINAL STATUS CLEANUP
+			if (TERMINAL_STATUSES.contains(status)) {
+				System.out.println("WEBHOOK TERMINAL STATUS → CLEANUP");
+				processedTransactions.add(txnId);
+				cleanup(txnId);
+			} else {
+				transactionStore.put(txnId, status);
+			}
+
+		} catch (Exception e) {
+			System.err.println(" WEBHOOK ERROR");
+			e.printStackTrace();
+		}
+
+		return ResponseEntity.ok("Webhook received");
+	}
 }
-
-
